@@ -168,4 +168,5 @@ def chat_update():
 
 if __name__ == '__main__':
     logging.info(f"Starting server on https://{IP}:{PORT}")
-    app.run(host=IP, port=PORT, ssl_context=('cert.pem', 'key.pem'))
+    app.run(host=IP, port=PORT)
+    #app.run(host=IP, port=PORT, ssl_context=('cert.pem', 'key.pem'))
