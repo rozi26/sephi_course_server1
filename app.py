@@ -24,8 +24,8 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-IP = "10.100.102.5"
-PORT = 443
+IP = "0.0.0.0"
+PORT = os.getenv("PORT",443)
 
 API_KEY = os.environ.get("EXTERNAL_API_KEY")
 OPEN_AI_CLIENT = openai.OpenAI(api_key=API_KEY)
