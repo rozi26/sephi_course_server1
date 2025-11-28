@@ -1,0 +1,4 @@
+ffmpeg
+flask
+requests
+openai
