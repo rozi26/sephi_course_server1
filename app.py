@@ -27,11 +27,14 @@ app = Flask(__name__)
 IP = "0.0.0.0"
 PORT = os.getenv("PORT",443)
 
-API_KEY = os.environ.get("EXTERNAL_API_KEY")
+API_KEY = os.environ.get("OPENAI_KEY")
+print(API_KEY)
 OPEN_AI_CLIENT = openai.OpenAI(api_key=API_KEY)
 
 TRANSCRIBE_MODEL = "whisper-1"
 CHAT_MODEL = "gpt-5.1"
+
+MAX_JOB_AGE = 30*60 # half hour
 
 @dataclass
 class ActiveJob:
@@ -39,6 +42,7 @@ class ActiveJob:
     thread: Thread
     start_time: float
     result: any = None
+    over: bool = False
 
 
 class BatchSerivce(ABC):
@@ -50,13 +54,18 @@ class BatchSerivce(ABC):
     def run_job(self, inp: any, code: str): pass
     
     def assigne_job(self, inp) -> str:
+        self.clean_old_jobs()
         code = str(random.randint(10**9,10**10))
         def job_runner():
             try:
-                self.run_job(inp,code)
+                res = self.run_job(inp,code)
+                job = self.jobs[code]
+                job.result = res
             except Exception as e:
                 logging.error(f"error in job thread {e}")
                 return None
+            finally:
+                self.terminate_job(code)
         runner = Thread(target=job_runner).start()
         self.jobs[code] = ActiveJob(code,runner,time.time(),None)
         self.active_calls += 1
@@ -67,14 +76,37 @@ class BatchSerivce(ABC):
         job: ActiveJob = self.jobs[code]
         if (job.result is not None): return job.result, True
         else: return None, False
+    
+    def get_job(self, code: str) -> ActiveJob:
+        if (not code in self.jobs): raise RuntimeError("try to acsses job that doesn't exist")
+        return self.jobs[code]
+        
+    def terminate_job(self, code):
+        logging.info(f"terminate job [{code}]")
+        job = self.jobs[code]
+        if (job.over): 
+            logging.warning("try to terminate unactive job"); return
+        job.over = True
+        self.active_calls -= 1
+    
+    def clean_old_jobs(self):
+        current_time = time.time()
+        for code,job in self.jobs.items():
+            age = current_time - job.start_time
+            if (age > MAX_JOB_AGE):
+                logging.info(f"remove the job [{code}] because of age")
+                self.jobs.pop(code)
+        
 
 class TranscribeService(BatchSerivce):
     def __init__(self):  super().__init__()
     
     def run_job(self, inp, code):
+        logging.info(f"got transcribe request with {inp} [{code}]")
         file_url = inp["file_url"]
         file_req = req.get(file_url)
-        
+        input_size =  int(file_req.headers.get("Content-Length", 0))
+        logging.info(f"got file from size {input_size}")
         input_stream = io.BytesIO(file_req.content)
         output_stream = io.BytesIO()
        
@@ -91,11 +123,12 @@ class TranscribeService(BatchSerivce):
         output_stream.seek(0)
         output_stream.name = "audio.mp3"
         
-        transcribetion = OPEN_AI_CLIENT.audio.transcriptions.create(TRANSCRIBE_MODEL,file=output_stream,response_format='text')
+        logging.info(f"file audio size: {output_stream.getbuffer().nbytes}")
+        transcribetion = OPEN_AI_CLIENT.audio.transcriptions.create(model=TRANSCRIBE_MODEL,file=output_stream,response_format='text')
         
         job = self.jobs[code]
-        job.result = transcribetion
         logging.info(f"done transcribtion after [{round(time.time()-job.start_time,2)}]")  
+        return transcribetion
 
 class ChatService(BatchSerivce):
     def __init__(self): super().__init__()
@@ -109,7 +142,7 @@ class ChatService(BatchSerivce):
         
         job = self.jobs[code]
         logging.info(f"got gpt answer after {round(time.time()-job.start_time,2)}s")
-        job.result = answer
+        return answer
 
 TRAN_SERVICE = TranscribeService()
 CHAT_SERVICE = ChatService()
@@ -119,12 +152,15 @@ def send_response(table):
     resp.headers.add("Access-Control-Allow-Origin","*")
     resp.headers.add("Content-Type", "application/json")
     resp.headers.add("Access-Control-Allow-Headers","Content-Type")
-    return resp
+    return resp 
+
+def job_to_json(job: ActiveJob) -> Dict:
+    return {"over":job.over, "have_result": (job.result is not None), "res":job.result}
 
 @app.get("/test")
 def test():
     logging.info("call test")
-    return send_response({"message":"hello this is a test"})
+    return send_response({"message":f"hello this is a test\ntime: {datetime.datetime.now()}\nactive tran {TRAN_SERVICE.active_calls}\n active chat {CHAT_SERVICE.active_calls}"})
 
 @app.post('/transcribe')
 def transcribe():
@@ -139,9 +175,8 @@ def transcribe():
 def transcribe_update():
     try:
         code = request.json["code"]
-        res, found = TRAN_SERVICE.get_job_update(code)
-        if (not found): return send_response({"done":False})
-        return send_response({"done":True,"res":res})
+        job = TRAN_SERVICE.get_job(code)
+        return send_response(job_to_json(job))
     except Exception as e:
         logging.error(f"transcribe update fail with {e}")
         return send_response({"message":f"transcribe update error {e}"})
@@ -159,9 +194,8 @@ def chat():
 def chat_update():
     try:
         code = request.json["code"]
-        res, found = CHAT_SERVICE.get_job_update(code)
-        if (not found): return send_response({"done":False})
-        return send_response({"done":True,"res":res})
+        job = CHAT_SERVICE.get_job(code)
+        return send_response(job_to_json(job))
     except Exception as e:
         logging.error(f"chat update fail with {e}")
         return send_response({"message":f"chat update error {e}"})
